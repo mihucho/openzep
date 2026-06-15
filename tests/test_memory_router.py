@@ -1,7 +1,12 @@
 import unittest
+import os
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+
+os.environ.setdefault("LLM_API_KEY", "test-key")
+os.environ.setdefault("LLM_BASE_URL", "http://localhost:11111/v1")
+os.environ.setdefault("LLM_MODEL", "test-model")
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient

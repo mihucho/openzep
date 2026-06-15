@@ -15,7 +15,7 @@ def verify_api_key(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Security(bearerScheme),
 ):
-    if settings.api_key is None:
+    if settings.api_key is None or settings.api_key == "":
         return
     # 支持 Bearer 和 Api-Key 两种格式
     token = None
@@ -28,5 +28,10 @@ def verify_api_key(
     if token != settings.api_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing API key",
+            detail=(
+                "Invalid or missing API key. The ZEP_API_KEY on the client side must "
+                "exactly match the API_KEY in openzep/.env. If you are connecting from a "
+                "Docker container, confirm ZEP_BASE_URL points at the host "
+                "(host.docker.internal or the host LAN IP) and ends with /api/v2."
+            ),
         )

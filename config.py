@@ -31,6 +31,13 @@ class Settings(BaseSettings):
     # Auth
     api_key: str | None = None  # if set, require Authorization: Bearer <key>
 
+    # Episode ingestion tuning (issue #4). Slow upstream LLMs need longer windows.
+    graph_max_concurrent_batches: int = 2
+    graph_max_bulk_retries: int = 2
+    graph_max_single_retries: int = 2
+    graph_bulk_timeout_seconds: int = 90
+    graph_single_timeout_seconds: int = 60
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 

@@ -11,6 +11,7 @@ from graphiti_core.utils.bulk_utils import RawEpisode
 import openai
 
 from deps import get_graphiti, verify_api_key
+from config import settings
 from engine.data_ingestion import normalize_episode_body, normalize_episode_type
 from engine.graphiti_engine import add_single_episode
 from models.graph import (
@@ -23,6 +24,8 @@ from models.graph import (
     GraphAddBatchResponse,
     GraphAddRequest,
     GraphCreateRequest,
+    GraphListItem,
+    GraphListResponse,
     GraphResponse,
     GraphSearchRequest,
     GraphSearchResponse,
@@ -68,11 +71,13 @@ async def graph_add(body: GraphAddRequest, request: Request):
 # Maps fake episode uuid -> True (processed) / False (pending)
 _episode_status: dict[str, bool] = {}
 _processing_sem: asyncio.Semaphore | None = None
-_MAX_CONCURRENT_BATCHES = 2
-_MAX_BULK_RETRIES = 2
-_MAX_SINGLE_RETRIES = 2
-_BULK_TIMEOUT_SECONDS = 45
-_SINGLE_TIMEOUT_SECONDS = 30
+
+# Issue #4: timeouts/retries are configurable so slow upstream LLMs don't drop episodes.
+_MAX_CONCURRENT_BATCHES = settings.graph_max_concurrent_batches
+_MAX_BULK_RETRIES = settings.graph_max_bulk_retries
+_MAX_SINGLE_RETRIES = settings.graph_max_single_retries
+_BULK_TIMEOUT_SECONDS = settings.graph_bulk_timeout_seconds
+_SINGLE_TIMEOUT_SECONDS = settings.graph_single_timeout_seconds
 
 
 def _get_processing_sem() -> asyncio.Semaphore:
@@ -514,7 +519,149 @@ async def delete_graph(graph_id: str, request: Request):
     return {"deleted": True, "graph_id": graph_id, "episodes_removed": len(episodes)}
 
 
-# ── entity-types stub ─────────────────────────────────────────────────────────
+# ── graph.list-all (issue #12) ────────────────────────────────────────────────
+#
+# Each graph_id is materialized as its own Neo4j database (graphiti clones the
+# driver with database=group_id), so enumerating graphs means listing databases.
+# Falls back to scanning group_id properties on the configured DB for drivers
+# that don't expose SHOW DATABASES (e.g. FalkorDB or restricted Neo4j users).
+
+_SYSTEM_DATABASES = {"neo4j", "system"}
+
+
+def _record_get(record, key):
+    """Read a field from a result record regardless of whether it is a dict,
+    a Neo4j Record (subscript), or a plain namespace (attribute)."""
+    try:
+        value = record[key]
+        if value is not None:
+            return value
+    except (KeyError, IndexError, TypeError):
+        pass
+    return getattr(record, key, None)
+
+
+async def _list_all_graphs(driver, *, limit: int, offset: int) -> GraphListResponse:
+    names: list[str]
+    per_database = False
+
+    try:
+        result = await driver.client.execute_query("SHOW DATABASES", database_="system")
+        names = [
+            name
+            for record in result.records
+            if (name := _record_get(record, "name")) and name not in _SYSTEM_DATABASES
+        ]
+        per_database = bool(names)
+    except Exception:
+        names = []
+
+    if not per_database:
+        try:
+            result = await driver.execute_query(
+                "MATCH (n) WHERE n.group_id IS NOT NULL "
+                "RETURN DISTINCT n.group_id AS gid ORDER BY gid"
+            )
+            names = [gid for record in result.records if (gid := _record_get(record, "gid"))]
+        except Exception:
+            names = []
+
+    total_count = len(names)
+    page = names[offset : offset + limit] if offset >= 0 else names[:limit]
+
+    items: list[GraphListItem] = []
+    for name in page:
+        node_count, edge_count, created_at = await _graph_counts(
+            driver, name, per_database=per_database
+        )
+        items.append(
+            GraphListItem(
+                graph_id=name,
+                name=name,
+                node_count=node_count,
+                edge_count=edge_count,
+                created_at=created_at,
+            )
+        )
+
+    items.sort(key=lambda item: (item.created_at is None, -(item.created_at.timestamp() if item.created_at else 0), item.name))
+
+    return GraphListResponse(
+        graphs=items,
+        total_count=total_count,
+        limit=limit,
+        offset=offset,
+    )
+
+
+async def _graph_counts(driver, name: str, *, per_database: bool):
+    """Best-effort node/edge counts and earliest created_at for one graph.
+
+    A single bad graph (missing database, query error) must not break listing —
+    failures degrade to zeros.
+    """
+    try:
+        if per_database:
+            clone = driver.clone(database=name)
+            node_res = await clone.execute_query(
+                "MATCH (n:Entity) WHERE n.group_id IS NOT NULL RETURN count(n) AS c"
+            )
+            edge_res = await clone.execute_query(
+                "MATCH ()-[e:RELATES_TO]->() WHERE e.group_id IS NOT NULL RETURN count(e) AS c"
+            )
+            time_res = await clone.execute_query(
+                "MATCH (n) WHERE n.group_id IS NOT NULL AND n.created_at IS NOT NULL "
+                "RETURN min(n.created_at) AS t"
+            )
+        else:
+            node_res = await driver.execute_query(
+                "MATCH (n:Entity {group_id: $g}) RETURN count(n) AS c", g=name
+            )
+            edge_res = await driver.execute_query(
+                "MATCH ()-[e:RELATES_TO {group_id: $g}]->() RETURN count(e) AS c", g=name
+            )
+            time_res = await driver.execute_query(
+                "MATCH (n {group_id: $g}) WHERE n.created_at IS NOT NULL "
+                "RETURN min(n.created_at) AS t",
+                g=name,
+            )
+
+        node_count = _first_int(node_res, "c")
+        edge_count = _first_int(edge_res, "c")
+        created_at = _first_datetime(time_res, "t")
+        return node_count, edge_count, created_at
+    except Exception:
+        logger.warning("graph counts unavailable for %s, defaulting to zero", name, exc_info=True)
+        return 0, 0, None
+
+
+def _first_int(result, key: str) -> int:
+    records = getattr(result, "records", []) or []
+    if records:
+        value = _record_get(records[0], key)
+        if isinstance(value, int):
+            return value
+    return 0
+
+
+def _first_datetime(result, key: str):
+    records = getattr(result, "records", []) or []
+    if records:
+        value = _record_get(records[0], key)
+        if isinstance(value, datetime):
+            return value
+    return None
+
+
+@router.get("/graph/list-all", response_model=GraphListResponse)
+async def list_all_graphs(request: Request, limit: int = 50, offset: int = 0):
+    graphiti = get_graphiti(request)
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    return await _list_all_graphs(graphiti.driver, limit=limit, offset=offset)
+
+
+# ── graph statistics ──────────────────────────────────────────────────────────
 
 @router.put("/entity-types")
 async def set_entity_types(body: EntityTypesRequest):

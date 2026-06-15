@@ -1,6 +1,11 @@
 import json
+import os
 import unittest
 from datetime import datetime, timezone
+
+os.environ.setdefault("LLM_API_KEY", "test-key")
+os.environ.setdefault("LLM_BASE_URL", "http://localhost:11111/v1")
+os.environ.setdefault("LLM_MODEL", "test-model")
 
 from engine.graphiti_engine import sanitize_graph_attributes
 

@@ -124,7 +124,8 @@ fi
 echo
 prompt_value "API_KEY" "OpenZep API Key（留空自动生成）" "$(read_env_value API_KEY "$ENV_FILE")" 1 0
 if [[ -z "$API_KEY" ]]; then
-    API_KEY="openzep-$(cat /dev/urandom | tr -dc 'a-z0-9' | head -c 12)"
+    API_KEY="$(od -An -N 6 -tx1 /dev/urandom)"
+    API_KEY="openzep-${API_KEY//[[:space:]]/}"
     info "已生成随机 API Key: ${BOLD}${API_KEY}${NC}"
 fi
 prompt_value "NEO4J_PASSWORD" "Neo4j 密码" "$(read_env_value NEO4J_PASSWORD "$ENV_FILE")" 1 0

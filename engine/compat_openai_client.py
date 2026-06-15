@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import re
@@ -18,8 +19,69 @@ from graphiti_core.prompts.models import Message
 logger = logging.getLogger(__name__)
 
 
+def _looks_like_schema_error(exc: Exception) -> bool:
+    """True when an LLM API error indicates the structured-output schema was rejected."""
+    message = str(exc).lower()
+    return any(
+        token in message
+        for token in (
+            "json_schema",
+            "response_format",
+            "additional_properties",
+            "additionalproperties",
+            "strict",
+        )
+    )
+
+
 class CompatOpenAIGenericClient(OpenAIGenericClient):
     """OpenAI-compatible client with tolerant JSON extraction for loose proxies."""
+
+    @staticmethod
+    def _normalize_strict_schema(schema: dict) -> dict:
+        """Recursively normalize a JSON schema to be OpenAI strict-compatible.
+
+        For every object node: sets additionalProperties=False and populates
+        required with all property keys. Does not mutate the input.
+        """
+        schema = copy.deepcopy(schema)
+
+        def _walk(node: Any) -> Any:
+            if not isinstance(node, dict):
+                return node
+
+            # Recurse into $defs / definitions first so nested types are normalized
+            for defs_key in ("$defs", "definitions"):
+                if defs_key in node:
+                    node[defs_key] = {k: _walk(v) for k, v in node[defs_key].items()}
+
+            # Recurse into allOf / anyOf / oneOf entries
+            for combiner in ("allOf", "anyOf", "oneOf"):
+                if combiner in node:
+                    node[combiner] = [_walk(entry) for entry in node[combiner]]
+
+            # Recurse into array items
+            if "items" in node:
+                node["items"] = _walk(node["items"])
+
+            # Recurse into properties values and enforce object constraints
+            if "properties" in node or node.get("type") == "object":
+                if "properties" in node:
+                    node["properties"] = {k: _walk(v) for k, v in node["properties"].items()}
+                    props = list(node["properties"].keys())
+                    # Preserve order, dedupe
+                    seen: set[str] = set()
+                    unique_props = []
+                    for p in props:
+                        if p not in seen:
+                            seen.add(p)
+                            unique_props.append(p)
+                    node["required"] = unique_props
+                node["additionalProperties"] = False
+
+            return node
+
+        return _walk(schema)
 
     @staticmethod
     def _is_list_field(response_model: type[BaseModel], field_name: str) -> bool:
@@ -140,14 +202,17 @@ class CompatOpenAIGenericClient(OpenAIGenericClient):
             if message.role in {"user", "system"}:
                 openai_messages.append({"role": message.role, "content": message.content})
 
+        strict_schema: dict[str, Any] | None = None
         try:
             response_format: dict[str, Any] = {"type": "json_object"}
             if response_model is not None:
+                strict_schema = self._normalize_strict_schema(response_model.model_json_schema())
                 response_format = {
                     "type": "json_schema",
                     "json_schema": {
                         "name": getattr(response_model, "__name__", "structured_response"),
-                        "schema": response_model.model_json_schema(),
+                        "schema": strict_schema,
+                        "strict": True,
                     },
                 }
 
@@ -158,16 +223,44 @@ class CompatOpenAIGenericClient(OpenAIGenericClient):
                 max_tokens=self.max_tokens,
                 response_format=response_format,  # type: ignore[arg-type]
             )
-
-            raw_content = response.choices[0].message.content or ""
-            normalized = self._extract_json_text(raw_content)
-            if not normalized:
-                raise json.JSONDecodeError("Empty content", raw_content, 0)
-
-            parsed = json.loads(normalized)
-            return self._normalize_payload(parsed, response_model, messages)
         except openai.RateLimitError as exc:
             raise RateLimitError from exc
-        except Exception as exc:
-            logger.error("Error in generating LLM response: %s", exc)
-            raise
+        except openai.BadRequestError as exc:
+            if not _looks_like_schema_error(exc) or response_model is None:
+                raise
+            logger.warning(
+                "Provider rejected strict json_schema, retrying with json_object: %s", exc
+            )
+            fallback_messages = list(openai_messages)
+            if fallback_messages and fallback_messages[-1].get("role") == "user":
+                hint = (
+                    "\n\nYou MUST respond with a valid JSON object matching this schema exactly: "
+                    f"{json.dumps(strict_schema, ensure_ascii=False)}"
+                )
+                fallback_messages[-1] = dict(fallback_messages[-1])
+                fallback_messages[-1]["content"] = str(fallback_messages[-1]["content"]) + hint
+            else:
+                fallback_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Respond with a valid JSON object matching this schema exactly: "
+                            f"{json.dumps(strict_schema, ensure_ascii=False)}"
+                        ),
+                    }
+                )
+            response = await self.client.chat.completions.create(
+                model=self.model or DEFAULT_MODEL,
+                messages=fallback_messages,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                response_format={"type": "json_object"},  # type: ignore[arg-type]
+            )
+
+        raw_content = response.choices[0].message.content or ""
+        normalized = self._extract_json_text(raw_content)
+        if not normalized:
+            raise json.JSONDecodeError("Empty content", raw_content, 0)
+
+        parsed = json.loads(normalized)
+        return self._normalize_payload(parsed, response_model, messages)

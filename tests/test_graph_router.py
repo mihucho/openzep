@@ -1,12 +1,18 @@
 import unittest
+import os
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+
+os.environ.setdefault("LLM_API_KEY", "test-key")
+os.environ.setdefault("LLM_BASE_URL", "http://localhost:11111/v1")
+os.environ.setdefault("LLM_MODEL", "test-model")
 
 from graphiti_core.nodes import EpisodeType
 from graphiti_core.utils.bulk_utils import RawEpisode
 
 from models.graph import GraphAddBatchRequest
-from routers.graph import _add_episode_bulk_resilient
+from routers.graph import _add_episode_bulk_resilient, _list_all_graphs
 
 
 def _raw_episode(name: str) -> RawEpisode:
@@ -50,6 +56,58 @@ class GraphRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(graphiti.add_episode_bulk.await_count, 2)
         graphiti.add_episode.assert_awaited_once()
         self.assertEqual(graphiti.add_episode.await_args.kwargs["name"], "ep1")
+
+    async def test_list_all_enumerates_databases_excluding_system(self):
+        """#12: graphs are Neo4j databases; neo4j/system must be filtered out."""
+        db_rows = [
+            {"name": "graphA"},
+            {"name": "neo4j"},
+            {"name": "system"},
+            {"name": "graphB"},
+        ]
+
+        def _records_with(key):
+            class _Result:
+                def __init__(self, value):
+                    self.records = [SimpleNamespace(**{key: value})]
+            return _Result
+
+        async def client_execute(query, **kwargs):
+            # EagerResult.records are indexable via attribute on SimpleNamespace
+            class _R:
+                def __init__(self, rows):
+                    self.records = [SimpleNamespace(**row) for row in rows]
+            return _R(db_rows)
+
+        clone_calls = {"n": 0}
+
+        async def clone_execute(query, **kwargs):
+            # alternate node/edge counts deterministically
+            clone_calls["n"] += 1
+            value = 5 if clone_calls["n"] % 2 == 1 else 2
+
+            class _R:
+                def __init__(self, v):
+                    self.records = [SimpleNamespace(c=v, t=None)]
+            return _R(value)
+
+        clone = SimpleNamespace(execute_query=AsyncMock(side_effect=clone_execute))
+
+        driver = SimpleNamespace(
+            client=SimpleNamespace(execute_query=AsyncMock(side_effect=client_execute)),
+            clone=Mock(return_value=clone),
+            execute_query=AsyncMock(),
+        )
+
+        response = await _list_all_graphs(driver, limit=10, offset=0)
+
+        self.assertEqual(response.total_count, 2)
+        names = {item.name for item in response.graphs}
+        self.assertEqual(names, {"graphA", "graphB"})
+        self.assertNotIn("neo4j", names)
+        self.assertNotIn("system", names)
+        self.assertEqual(response.limit, 10)
+        self.assertEqual(response.offset, 0)
 
 
 if __name__ == "__main__":

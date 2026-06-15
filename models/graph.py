@@ -147,3 +147,20 @@ class GraphStatisticsResponse(BaseModel):
     node_count: int
     edge_count: int
     episode_count: int
+
+
+# ── Graph listing (issue #12: /api/v2/graph/list-all) ─────────────────────────
+
+class GraphListItem(BaseModel):
+    graph_id: str
+    name: str
+    node_count: int = 0
+    edge_count: int = 0
+    created_at: datetime | None = None
+
+
+class GraphListResponse(BaseModel):
+    graphs: list[GraphListItem]
+    total_count: int
+    limit: int
+    offset: int

@@ -149,7 +149,7 @@ else
     echo -e "${BOLD}── 第 3 步：OpenZep API Key ──────────────────${NC}"
     prompt_value "API_KEY" "设置服务 API Key（留空自动生成）" "" 1 0
     if [ -z "$API_KEY" ]; then
-        API_KEY="$(od -An -N 6 -tx1 /dev/urandom)"
+        API_KEY="$(od -An -N 16 -tx1 /dev/urandom)"
         API_KEY="openzep-${API_KEY//[[:space:]]/}"
         info "已生成随机 API Key: ${BOLD}${API_KEY}${NC}"
     fi

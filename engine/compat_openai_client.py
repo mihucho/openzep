@@ -19,18 +19,31 @@ from graphiti_core.prompts.models import Message
 logger = logging.getLogger(__name__)
 
 
+_SCHEMA_ERROR_STRONG_TOKENS = (
+    "json_schema",
+    "response_format",
+    "additional_properties",
+    "additionalproperties",
+    "structured output",
+    "structured_output",
+)
+# "strict" alone is too generic (appears in many unrelated errors), so it only
+# counts as a signal when a structured-output-specific token is also present.
+_SCHEMA_ERROR_WEAK_TOKENS = ("strict",)
+_SCHEMA_ERROR_CONTEXT_TOKENS = ("schema", "response", "json", "structured")
+
+
 def _looks_like_schema_error(exc: Exception) -> bool:
-    """True when an LLM API error indicates the structured-output schema was rejected."""
+    """True when an LLM API error indicates the structured-output schema was rejected.
+
+    Requires a specific token (json_schema / response_format / additional_properties).
+    Bare "strict" is not enough on its own — too many unrelated errors mention it.
+    """
     message = str(exc).lower()
-    return any(
-        token in message
-        for token in (
-            "json_schema",
-            "response_format",
-            "additional_properties",
-            "additionalproperties",
-            "strict",
-        )
+    if any(token in message for token in _SCHEMA_ERROR_STRONG_TOKENS):
+        return True
+    return any(token in message for token in _SCHEMA_ERROR_WEAK_TOKENS) and any(
+        token in message for token in ("schema", "response", "json")
     )
 
 

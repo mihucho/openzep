@@ -153,5 +153,39 @@ class StrictSchemaTests(unittest.TestCase):
         self.assertFalse(normalized["additionalProperties"])
 
 
+class SchemaErrorClassificationTests(unittest.TestCase):
+    def test_strong_token_triggers_schema_error(self):
+        from engine.compat_openai_client import _looks_like_schema_error
+
+        class _E(Exception):
+            def __init__(self, msg):
+                super().__init__(msg)
+
+        self.assertTrue(_looks_like_schema_error(_E("unsupported json_schema")))
+        self.assertTrue(_looks_like_schema_error(_E("invalid response_format")))
+        self.assertTrue(_looks_like_schema_error(_E("additional_properties not allowed")))
+
+    def test_bare_strict_does_not_trigger(self):
+        """Bare 'strict' is too generic — must not cause a fallback on its own."""
+        from engine.compat_openai_client import _looks_like_schema_error
+
+        class _E(Exception):
+            def __init__(self, msg):
+                super().__init__(msg)
+
+        self.assertFalse(_looks_like_schema_error(_E("strict mode violation in policy")))
+        self.assertFalse(_looks_like_schema_error(_E("content too strict")))
+
+    def test_strict_with_schema_context_triggers(self):
+        from engine.compat_openai_client import _looks_like_schema_error
+
+        class _E(Exception):
+            def __init__(self, msg):
+                super().__init__(msg)
+
+        self.assertTrue(_looks_like_schema_error(_E("strict structured output rejected")))
+        self.assertTrue(_looks_like_schema_error(_E("json strict mode error")))
+
+
 if __name__ == "__main__":
     unittest.main()

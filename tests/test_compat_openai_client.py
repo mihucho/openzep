@@ -131,6 +131,27 @@ class StrictSchemaTests(unittest.TestCase):
         # Input must not be mutated
         self.assertEqual(original, snapshot)
 
+    def test_normalize_strict_schema_preserves_map_type_values(self):
+        """A dict[str, X] field emits `additionalProperties` as a schema object
+        (the value type). That must survive normalization — overwriting it with
+        False would change the field's meaning from a map to a closed object."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "counts": {
+                    "type": "object",
+                    "additionalProperties": {"type": "integer"},
+                },
+            },
+        }
+
+        normalized = CompatOpenAIGenericClient._normalize_strict_schema(schema)
+
+        counts = normalized["properties"]["counts"]
+        self.assertEqual(counts["additionalProperties"], {"type": "integer"})
+        # The fixed-property root object still gets the closure
+        self.assertFalse(normalized["additionalProperties"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,3 +1,5 @@
+import hmac
+
 from fastapi import Depends, HTTPException, Request, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -15,7 +17,7 @@ def verify_api_key(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Security(bearerScheme),
 ):
-    if settings.api_key is None or settings.api_key == "":
+    if not settings.api_key:
         return
     # 支持 Bearer 和 Api-Key 两种格式
     token = None
@@ -25,7 +27,8 @@ def verify_api_key(
         auth_header = request.headers.get("Authorization", "")
         if auth_header.lower().startswith("api-key "):
             token = auth_header[8:]
-    if token != settings.api_key:
+    # Constant-time comparison to avoid leaking key length / prefix via timing.
+    if token is None or not hmac.compare_digest(token, settings.api_key):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=(

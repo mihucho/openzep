@@ -77,7 +77,14 @@ class CompatOpenAIGenericClient(OpenAIGenericClient):
                             seen.add(p)
                             unique_props.append(p)
                     node["required"] = unique_props
-                node["additionalProperties"] = False
+
+                # `additionalProperties` as a schema object signals a map/dict
+                # field (dict[str, X]). Such nodes must keep their value-type
+                # schema — clobbering it to False would change the type's meaning
+                # from "any key -> X" to "no extra keys allowed". Only force the
+                # bool closure for fixed-property objects.
+                if not isinstance(node.get("additionalProperties"), dict):
+                    node["additionalProperties"] = False
 
             return node
 
@@ -203,6 +210,7 @@ class CompatOpenAIGenericClient(OpenAIGenericClient):
                 openai_messages.append({"role": message.role, "content": message.content})
 
         strict_schema: dict[str, Any] | None = None
+        effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
         try:
             response_format: dict[str, Any] = {"type": "json_object"}
             if response_model is not None:
@@ -220,7 +228,7 @@ class CompatOpenAIGenericClient(OpenAIGenericClient):
                 model=self.model or DEFAULT_MODEL,
                 messages=openai_messages,
                 temperature=self.temperature,
-                max_tokens=self.max_tokens,
+                max_tokens=effective_max_tokens,
                 response_format=response_format,  # type: ignore[arg-type]
             )
         except openai.RateLimitError as exc:
@@ -253,7 +261,7 @@ class CompatOpenAIGenericClient(OpenAIGenericClient):
                 model=self.model or DEFAULT_MODEL,
                 messages=fallback_messages,
                 temperature=self.temperature,
-                max_tokens=self.max_tokens,
+                max_tokens=effective_max_tokens,
                 response_format={"type": "json_object"},  # type: ignore[arg-type]
             )
 

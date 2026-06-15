@@ -2,7 +2,7 @@ import unittest
 import os
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault("LLM_API_KEY", "test-key")
 os.environ.setdefault("LLM_BASE_URL", "http://localhost:11111/v1")
@@ -57,57 +57,74 @@ class GraphRouterTests(unittest.IsolatedAsyncioTestCase):
         graphiti.add_episode.assert_awaited_once()
         self.assertEqual(graphiti.add_episode.await_args.kwargs["name"], "ep1")
 
-    async def test_list_all_enumerates_databases_excluding_system(self):
-        """#12: graphs are Neo4j databases; neo4j/system must be filtered out."""
-        db_rows = [
-            {"name": "graphA"},
-            {"name": "neo4j"},
-            {"name": "system"},
-            {"name": "graphB"},
+    async def test_list_all_aggregates_by_group_id_in_single_db(self):
+        """#12: all graphs share one Neo4j DB partitioned by group_id, so
+        list-all aggregates via GROUP BY n.group_id — not SHOW DATABASES."""
+        # node aggregation: two groups with counts + earliest created_at
+        node_rows = [
+            {"gid": "graphA", "c": 5, "t": datetime(2026, 6, 1, tzinfo=timezone.utc)},
+            {"gid": "graphB", "c": 2, "t": datetime(2026, 5, 1, tzinfo=timezone.utc)},
+        ]
+        # edge aggregation: graphA has 3 edges; graphC has edges but no Entity nodes yet
+        edge_rows = [
+            {"gid": "graphA", "c": 3},
+            {"gid": "graphC", "c": 4},
         ]
 
-        def _records_with(key):
-            class _Result:
-                def __init__(self, value):
-                    self.records = [SimpleNamespace(**{key: value})]
-            return _Result
+        def _result(rows):
+            return SimpleNamespace(records=[SimpleNamespace(**row) for row in rows])
 
-        async def client_execute(query, **kwargs):
-            # EagerResult.records are indexable via attribute on SimpleNamespace
-            class _R:
-                def __init__(self, rows):
-                    self.records = [SimpleNamespace(**row) for row in rows]
-            return _R(db_rows)
+        async def execute_query(query, **kwargs):
+            if "MATCH (n:Entity)" in query:
+                return _result(node_rows)
+            return _result(edge_rows)
 
-        clone_calls = {"n": 0}
-
-        async def clone_execute(query, **kwargs):
-            # alternate node/edge counts deterministically
-            clone_calls["n"] += 1
-            value = 5 if clone_calls["n"] % 2 == 1 else 2
-
-            class _R:
-                def __init__(self, v):
-                    self.records = [SimpleNamespace(c=v, t=None)]
-            return _R(value)
-
-        clone = SimpleNamespace(execute_query=AsyncMock(side_effect=clone_execute))
-
-        driver = SimpleNamespace(
-            client=SimpleNamespace(execute_query=AsyncMock(side_effect=client_execute)),
-            clone=Mock(return_value=clone),
-            execute_query=AsyncMock(),
-        )
+        driver = SimpleNamespace(execute_query=AsyncMock(side_effect=execute_query))
 
         response = await _list_all_graphs(driver, limit=10, offset=0)
 
-        self.assertEqual(response.total_count, 2)
-        names = {item.name for item in response.graphs}
-        self.assertEqual(names, {"graphA", "graphB"})
-        self.assertNotIn("neo4j", names)
-        self.assertNotIn("system", names)
+        # union of node groups + edge-only groups
+        self.assertEqual(response.total_count, 3)
+        by_id = {g.graph_id: g for g in response.graphs}
+
+        self.assertEqual(by_id["graphA"].node_count, 5)
+        self.assertEqual(by_id["graphA"].edge_count, 3)
+        self.assertEqual(by_id["graphB"].node_count, 2)
+        self.assertEqual(by_id["graphB"].edge_count, 0)
+        # graphC appears via edges only, zero nodes
+        self.assertEqual(by_id["graphC"].node_count, 0)
+        self.assertEqual(by_id["graphC"].edge_count, 4)
+
+        # newest first (graphA 2026-06 > graphB 2026-05 > graphC no created_at)
+        order = [g.graph_id for g in response.graphs]
+        self.assertEqual(order, ["graphA", "graphB", "graphC"])
         self.assertEqual(response.limit, 10)
         self.assertEqual(response.offset, 0)
+        # driver.execute_query called exactly twice (nodes + edges), no N+1
+        self.assertEqual(driver.execute_query.await_count, 2)
+
+    async def test_list_all_pagination_applies_after_global_sort(self):
+        node_rows = [
+            {"gid": f"g{i}", "c": 1, "t": datetime(2026, 1, i + 1, tzinfo=timezone.utc)}
+            for i in range(5)
+        ]
+
+        async def execute_query(query, **kwargs):
+            if "MATCH (n:Entity)" in query:
+                return SimpleNamespace(records=[SimpleNamespace(**r) for r in node_rows])
+            return SimpleNamespace(records=[])
+
+        driver = SimpleNamespace(execute_query=AsyncMock(side_effect=execute_query))
+
+        page1 = await _list_all_graphs(driver, limit=2, offset=0)
+        page2 = await _list_all_graphs(driver, limit=2, offset=2)
+
+        # total is full set, but each page is sliced
+        self.assertEqual(page1.total_count, 5)
+        self.assertEqual(len(page1.graphs), 2)
+        # newest (g4, 2026-01-05) first
+        self.assertEqual([g.graph_id for g in page1.graphs], ["g4", "g3"])
+        self.assertEqual([g.graph_id for g in page2.graphs], ["g2", "g1"])
 
 
 if __name__ == "__main__":

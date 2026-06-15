@@ -17,6 +17,32 @@ success() { echo -e "  ${GREEN}[OK]${NC}   $*"; }
 warn()    { echo -e "  ${YELLOW}[WARN]${NC} $*"; }
 die()     { echo -e "  ${RED}[ERR]${NC}  $*"; exit 1; }
 
+# Portable in-place sed. `sed -i ''` is BSD-only and silently no-ops on GNU
+# sed (Linux), which previously caused .env / client patches to never apply.
+# `-i` with a backup suffix works on both; we remove the backup afterward.
+sed_inplace() {
+    local expr="$1"; shift
+    sed -i.bak "$expr" "$@"
+    local f
+    for f in "$@"; do rm -f "${f}.bak"; done
+}
+
+# Set or replace `KEY=...` in an env file. Shell-native: never interpolates the
+# value through sed, so secret characters like `&`, `|`, `/`, `\` are safe and
+# the script won't abort under `set -euo pipefail`. Values are passed via the
+# environment (not `awk -v`, which would interpret backslash escapes).
+set_env_var() {
+    local file="$1" key="$2" val="$3"
+    local tmp
+    tmp="$(mktemp)"
+    _OZ_KEY="$key" _OZ_VAL="$val" awk '
+        BEGIN { k = ENVIRON["_OZ_KEY"]; v = ENVIRON["_OZ_VAL"]; seen = 0 }
+        $0 ~ "^" k "=" { print k "=" v; seen = 1; next }
+        { print }
+        END { if (!seen) print k "=" v }
+    ' "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
 prompt_value() {
     local var_name="$1"
     local prompt_text="$2"
@@ -188,11 +214,7 @@ else
     touch "$OPENZEP_DIR/.env"
 fi
 
-if grep -qE '^API_KEY=' "$OPENZEP_DIR/.env" 2>/dev/null; then
-    sed -i '' "s|^API_KEY=.*|API_KEY=${OPENZEP_API_KEY}|" "$OPENZEP_DIR/.env"
-else
-    echo "API_KEY=${OPENZEP_API_KEY}" >> "$OPENZEP_DIR/.env"
-fi
+set_env_var "$OPENZEP_DIR/.env" "API_KEY" "$OPENZEP_API_KEY"
 
 success "OpenZep .env 已同步"
 echo
@@ -213,7 +235,7 @@ PATCHED=0
 SKIPPED=0
 
 for fname in "${TARGET_FILES[@]}"; do
-    fpath=$(find "$MIROFISH" -name "$fname" -type f 2>/dev/null | head -1)
+    fpath=$(find "$MIROFISH" -name "$fname" -type f 2>/dev/null | head -1 || true)
 
     if [[ -z "$fpath" ]]; then
         warn "未找到 $fname，跳过"
@@ -230,8 +252,8 @@ for fname in "${TARGET_FILES[@]}"; do
         continue
     fi
 
-    sed -i '' 's/Zep(api_key=self\.api_key)/Zep(api_key=self.api_key, base_url=Config.ZEP_BASE_URL)/g' "$fpath"
-    sed -i '' 's/Zep(api_key=self\.zep_api_key)/Zep(api_key=self.zep_api_key, base_url=Config.ZEP_BASE_URL)/g' "$fpath"
+    sed_inplace 's/Zep(api_key=self\.api_key)/Zep(api_key=self.api_key, base_url=Config.ZEP_BASE_URL)/g' "$fpath"
+    sed_inplace 's/Zep(api_key=self\.zep_api_key)/Zep(api_key=self.zep_api_key, base_url=Config.ZEP_BASE_URL)/g' "$fpath"
 
     success "已修改: $fname"
     ((PATCHED++)) || true
@@ -255,13 +277,8 @@ cp "$MIROFISH_ENV" "${MIROFISH_ENV}.bak"
 update_env() {
     local key="$1"
     local val="$2"
-    if grep -qE "^${key}=" "$MIROFISH_ENV" 2>/dev/null; then
-        sed -i '' "s|^${key}=.*|${key}=${val}|" "$MIROFISH_ENV"
-        info "更新: ${key}=${val}"
-    else
-        echo "${key}=${val}" >> "$MIROFISH_ENV"
-        info "追加: ${key}=${val}"
-    fi
+    set_env_var "$MIROFISH_ENV" "$key" "$val"
+    info "设置: ${key}=${val}"
 }
 
 update_env "ZEP_BASE_URL" "${MIROFISH_EFFECTIVE_OPENZEP_URL}/api/v2"
@@ -274,10 +291,10 @@ if [[ -n "$MIROFISH_COMPOSE_FILE" ]]; then
 fi
 
 # 在 config.py 里补充 ZEP_BASE_URL 字段（如果还没有）
-CONFIG_PY=$(find "$MIROFISH" -path '*/app/config.py' -type f 2>/dev/null | head -1)
+CONFIG_PY=$(find "$MIROFISH" -path '*/app/config.py' -type f 2>/dev/null | head -1 || true)
 if [[ -n "$CONFIG_PY" ]]; then
     if ! grep -q 'ZEP_BASE_URL' "$CONFIG_PY" 2>/dev/null; then
-        sed -i '' "s|ZEP_API_KEY = os.environ.get('ZEP_API_KEY')|ZEP_API_KEY = os.environ.get('ZEP_API_KEY')\n    ZEP_BASE_URL = os.environ.get('ZEP_BASE_URL', 'http://localhost:8000/api/v2')|" "$CONFIG_PY"
+        sed_inplace "s|ZEP_API_KEY = os.environ.get('ZEP_API_KEY')|ZEP_API_KEY = os.environ.get('ZEP_API_KEY')\n    ZEP_BASE_URL = os.environ.get('ZEP_BASE_URL', 'http://localhost:8000/api/v2')|" "$CONFIG_PY"
         success "config.py 已添加 ZEP_BASE_URL"
     else
         info "config.py 已含 ZEP_BASE_URL，跳过"

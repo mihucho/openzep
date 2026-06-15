@@ -521,13 +521,11 @@ async def delete_graph(graph_id: str, request: Request):
 
 # ── graph.list-all (issue #12) ────────────────────────────────────────────────
 #
-# Each graph_id is materialized as its own Neo4j database (graphiti clones the
-# driver with database=group_id), so enumerating graphs means listing databases.
-# Falls back to scanning group_id properties on the configured DB for drivers
-# that don't expose SHOW DATABASES (e.g. FalkorDB or restricted Neo4j users).
-
-_SYSTEM_DATABASES = {"neo4j", "system"}
-
+# All graphs share ONE Neo4j database; graphiti partitions them by the
+# `group_id` property on nodes/edges (driver.clone(database=...) is a no-op in
+# graphiti-core 0.29.x). So "list all graphs" is a GROUP BY group_id scan over
+# the configured database — not SHOW DATABASES, which would both miss real
+# graphs and leak unrelated Neo4j databases on shared instances.
 
 def _record_get(record, key):
     """Read a field from a result record regardless of whether it is a dict,
@@ -542,115 +540,77 @@ def _record_get(record, key):
 
 
 async def _list_all_graphs(driver, *, limit: int, offset: int) -> GraphListResponse:
-    names: list[str]
-    per_database = False
+    """Aggregate every graph (group_id) in one pass per side — two queries
+    total, no N+1. A failure on either side degrades to zeros, never aborts."""
 
+    nodes_by_gid: dict[str, dict] = {}
     try:
-        result = await driver.client.execute_query("SHOW DATABASES", database_="system")
-        names = [
-            name
-            for record in result.records
-            if (name := _record_get(record, "name")) and name not in _SYSTEM_DATABASES
-        ]
-        per_database = bool(names)
+        node_res = await driver.execute_query(
+            "MATCH (n:Entity) WHERE n.group_id IS NOT NULL "
+            "RETURN n.group_id AS gid, count(n) AS c, min(n.created_at) AS t"
+        )
+        for record in node_res.records:
+            gid = _record_get(record, "gid")
+            if not gid:
+                continue
+            nodes_by_gid[str(gid)] = {
+                "node_count": _as_int(_record_get(record, "c")),
+                "created_at": _as_datetime(_record_get(record, "t")),
+            }
     except Exception:
-        names = []
+        logger.warning("list-all: node aggregation failed", exc_info=True)
 
-    if not per_database:
-        try:
-            result = await driver.execute_query(
-                "MATCH (n) WHERE n.group_id IS NOT NULL "
-                "RETURN DISTINCT n.group_id AS gid ORDER BY gid"
-            )
-            names = [gid for record in result.records if (gid := _record_get(record, "gid"))]
-        except Exception:
-            names = []
-
-    total_count = len(names)
-    page = names[offset : offset + limit] if offset >= 0 else names[:limit]
-
-    items: list[GraphListItem] = []
-    for name in page:
-        node_count, edge_count, created_at = await _graph_counts(
-            driver, name, per_database=per_database
+    edge_counts: dict[str, int] = {}
+    try:
+        edge_res = await driver.execute_query(
+            "MATCH ()-[e:RELATES_TO]->() WHERE e.group_id IS NOT NULL "
+            "RETURN e.group_id AS gid, count(e) AS c"
         )
-        items.append(
-            GraphListItem(
-                graph_id=name,
-                name=name,
-                node_count=node_count,
-                edge_count=edge_count,
-                created_at=created_at,
-            )
-        )
+        for record in edge_res.records:
+            gid = _record_get(record, "gid")
+            if gid:
+                edge_counts[str(gid)] = _as_int(_record_get(record, "c"))
+    except Exception:
+        logger.warning("list-all: edge aggregation failed", exc_info=True)
 
-    items.sort(key=lambda item: (item.created_at is None, -(item.created_at.timestamp() if item.created_at else 0), item.name))
+    # A graph may exist with edges but no Entity nodes yet (or vice versa);
+    # union every group_id seen on either side.
+    items = [
+        GraphListItem(
+            graph_id=gid,
+            name=gid,
+            node_count=nodes_by_gid.get(gid, {}).get("node_count", 0),
+            edge_count=edge_counts.get(gid, 0),
+            created_at=nodes_by_gid.get(gid, {}).get("created_at"),
+        )
+        for gid in set(nodes_by_gid) | set(edge_counts)
+    ]
+
+    total_count = len(items)
+    # Global sort FIRST, then paginate, so offset/limit are meaningful.
+    items.sort(
+        key=lambda it: (
+            it.created_at is None,
+            -(it.created_at.timestamp() if it.created_at else 0),
+            it.name,
+        )
+    )
+    page = items[offset : offset + limit] if offset >= 0 else items[:limit]
 
     return GraphListResponse(
-        graphs=items,
+        graphs=page,
         total_count=total_count,
         limit=limit,
         offset=offset,
     )
 
 
-async def _graph_counts(driver, name: str, *, per_database: bool):
-    """Best-effort node/edge counts and earliest created_at for one graph.
-
-    A single bad graph (missing database, query error) must not break listing —
-    failures degrade to zeros.
-    """
-    try:
-        if per_database:
-            clone = driver.clone(database=name)
-            node_res = await clone.execute_query(
-                "MATCH (n:Entity) WHERE n.group_id IS NOT NULL RETURN count(n) AS c"
-            )
-            edge_res = await clone.execute_query(
-                "MATCH ()-[e:RELATES_TO]->() WHERE e.group_id IS NOT NULL RETURN count(e) AS c"
-            )
-            time_res = await clone.execute_query(
-                "MATCH (n) WHERE n.group_id IS NOT NULL AND n.created_at IS NOT NULL "
-                "RETURN min(n.created_at) AS t"
-            )
-        else:
-            node_res = await driver.execute_query(
-                "MATCH (n:Entity {group_id: $g}) RETURN count(n) AS c", g=name
-            )
-            edge_res = await driver.execute_query(
-                "MATCH ()-[e:RELATES_TO {group_id: $g}]->() RETURN count(e) AS c", g=name
-            )
-            time_res = await driver.execute_query(
-                "MATCH (n {group_id: $g}) WHERE n.created_at IS NOT NULL "
-                "RETURN min(n.created_at) AS t",
-                g=name,
-            )
-
-        node_count = _first_int(node_res, "c")
-        edge_count = _first_int(edge_res, "c")
-        created_at = _first_datetime(time_res, "t")
-        return node_count, edge_count, created_at
-    except Exception:
-        logger.warning("graph counts unavailable for %s, defaulting to zero", name, exc_info=True)
-        return 0, 0, None
+def _as_int(value) -> int:
+    return value if isinstance(value, int) else 0
 
 
-def _first_int(result, key: str) -> int:
-    records = getattr(result, "records", []) or []
-    if records:
-        value = _record_get(records[0], key)
-        if isinstance(value, int):
-            return value
-    return 0
-
-
-def _first_datetime(result, key: str):
-    records = getattr(result, "records", []) or []
-    if records:
-        value = _record_get(records[0], key)
-        if isinstance(value, datetime):
-            return value
-    return None
+def _as_datetime(value):
+    return value if isinstance(value, datetime) else None
 
 
 @router.get("/graph/list-all", response_model=GraphListResponse)

@@ -270,3 +270,17 @@ async def delete_fact_by_uuid(graphiti: Graphiti, uuid: str) -> bool:
         return True
     except Exception:
         return False
+
+
+async def delete_episode_by_uuid(graphiti: Graphiti, uuid: str) -> bool:
+    """Delete a single episode by UUID.
+
+    Returns True if the episode was found and removed, False otherwise.
+    Uses graphiti.remove_episode for full cascade cleanup (edges, entities).
+    """
+    try:
+        await graphiti.remove_episode(uuid)
+        return True
+    except Exception:
+        logger.exception("Failed to delete episode %s", uuid)
+        return False

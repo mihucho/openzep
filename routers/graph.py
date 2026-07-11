@@ -2,7 +2,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from graphiti_core.edges import EntityEdge
 from graphiti_core.errors import GroupsEdgesNotFoundError, GroupsNodesNotFoundError
 from graphiti_core.llm_client.errors import RateLimitError
@@ -13,7 +13,7 @@ import openai
 from deps import get_graphiti, verify_api_key
 from config import settings
 from engine.data_ingestion import normalize_episode_body, normalize_episode_type
-from engine.graphiti_engine import add_single_episode
+from engine.graphiti_engine import add_single_episode, delete_episode_by_uuid
 from models.graph import (
     EdgeListByGraphRequest,
     EdgeListResponse,
@@ -484,6 +484,21 @@ async def get_episode_by_uuid(uuid: str, request: Request):
             created_at=now,
             processed=True,
         )
+
+
+@router.delete("/graph/episodes/{uuid}")
+async def delete_episode_by_uuid_route(uuid: str, request: Request):
+    graphiti = get_graphiti(request)
+
+    # Fast path: fake uuid from add_batch that lives only in the in-memory tracker.
+    if uuid in _episode_status:
+        del _episode_status[uuid]
+        return {"message": "Episode deleted", "uuid": uuid}
+
+    deleted = await delete_episode_by_uuid(graphiti, uuid)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Episode not found")
+    return {"message": "Episode deleted", "uuid": uuid}
 
 
 # ── graph statistics ──────────────────────────────────────────────────────────

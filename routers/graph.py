@@ -48,7 +48,7 @@ async def graph_add(body: GraphAddRequest, request: Request):
     graphiti = get_graphiti(request)
     ref_time = body.created_at or datetime.now(timezone.utc)
     ontology = get_ontology(graph_id=body.graph_id, user_id=body.user_id)
-    name = await add_single_episode(
+    ep_uuid, ep_name = await add_single_episode(
         graphiti,
         graph_id=body.graph_id,
         data=body.data,
@@ -60,7 +60,8 @@ async def graph_add(body: GraphAddRequest, request: Request):
         edge_type_map=ontology.edge_type_map if ontology else None,
     )
     return {
-        "uuid": name,
+        "uuid": ep_uuid,
+        "name": ep_name,
         "graph_id": body.graph_id,
         "content": body.data,
         "created_at": ref_time.isoformat(),
@@ -466,24 +467,19 @@ async def get_episode_by_uuid(uuid: str, request: Request):
     # Real episode in Neo4j
     try:
         ep = await EpisodicNode.get_by_uuid(graphiti.driver, uuid=uuid)
-        return EpisodeResponse(
-            uuid=ep.uuid,
-            name=ep.name,
-            content=ep.content,
-            source_description=getattr(ep, "source_description", ""),
-            source=str(getattr(ep, "source", "message")),
-            created_at=getattr(ep, "created_at", None) or now,
-            group_id=getattr(ep, "group_id", ""),
-            processed=True,
-        )
     except Exception:
-        return EpisodeResponse(
-            uuid=uuid,
-            name="",
-            content="",
-            created_at=now,
-            processed=True,
-        )
+        raise HTTPException(status_code=404, detail="Episode not found")
+
+    return EpisodeResponse(
+        uuid=ep.uuid,
+        name=ep.name,
+        content=ep.content,
+        source_description=getattr(ep, "source_description", ""),
+        source=str(getattr(ep, "source", "message")),
+        created_at=getattr(ep, "created_at", None) or now,
+        group_id=getattr(ep, "group_id", ""),
+        processed=True,
+    )
 
 
 @router.delete("/graph/episodes/{uuid}")

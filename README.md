@@ -234,6 +234,19 @@ OpenZep 已通过与 [MiroFish](https://github.com/666ghj/MiroFish)（多智能�
 | `DELETE` | `/api/v2/graph/{graph_id}` | 删除整个图谱 |
 | `GET` | `/api/v2/graph/list-all` | 列出所有知识图谱（含节点/边数量） |
 
+### Batch ingestion
+
+兼容 `zep-cloud` SDK 3.25+ 的批量图谱写入流程：先创建 batch，再添加
+`graph_episode` items，最后调用 process 并轮询状态。
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/v2/batches` | 创建草稿 batch |
+| `POST` | `/api/v2/batches/{id}/items` | 添加图谱 episode items |
+| `POST` | `/api/v2/batches/{id}/process` | 开始异步处理 |
+| `GET` | `/api/v2/batches/{id}` | 查询 batch 状态 |
+| `GET` | `/api/v2/batches/{id}/items` | 查询 item 状态 |
+
 交互式 API 文档：`http://localhost:8000/docs`
 
 ---

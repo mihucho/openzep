@@ -8,9 +8,23 @@ os.environ.setdefault("LLM_BASE_URL", "http://localhost:11111/v1")
 os.environ.setdefault("LLM_MODEL", "test-model")
 
 from engine.graphiti_engine import sanitize_graph_attributes
+from routers.graph import _ensure_custom_label
+from ontology_registry import compile_ontology
 
 
 class GraphitiEngineTests(unittest.TestCase):
+    def test_nodes_without_custom_labels_get_mirofish_fallback_label(self):
+        self.assertEqual(_ensure_custom_label(["Entity", "Node"]), ["Entity", "Node", "ExtractedEntity"])
+        self.assertEqual(_ensure_custom_label(["Entity", "Person"]), ["Entity", "Person"])
+
+    def test_ontology_compiles_entity_and_edge_models(self):
+        ontology = compile_ontology(
+            [{"name": "Person", "properties": [{"name": "age", "type": "int"}]}],
+            [{"name": "Knows", "source_targets": [{"source": "Person", "target": "Person"}]}],
+        )
+        self.assertIn("Person", ontology.entity_types)
+        self.assertIn("Knows", ontology.edge_types)
+        self.assertEqual(ontology.edge_type_map[("Person", "Person")], ["Knows"])
     def test_sanitize_graph_attributes_stringifies_nested_structures(self):
         now = datetime(2026, 3, 16, 12, 30, tzinfo=timezone.utc)
         attributes = {

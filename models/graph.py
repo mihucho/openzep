@@ -140,6 +140,15 @@ class GraphAddBatchResponse(BaseModel):
     graph_id: str
 
 
+class BatchCreateRequest(BaseModel):
+    ignore_roles: list[str] | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class BatchItemsRequest(BaseModel):
+    items: list[dict[str, Any]]
+
+
 # ── Graph statistics ──────────────────────────────────────────────────────────
 
 class GraphStatisticsResponse(BaseModel):

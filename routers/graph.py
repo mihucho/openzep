@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -22,6 +23,8 @@ from models.graph import (
     EpisodeResponse,
     GraphAddBatchRequest,
     GraphAddBatchResponse,
+    BatchCreateRequest,
+    BatchItemsRequest,
     GraphAddRequest,
     GraphCreateRequest,
     GraphListItem,
@@ -71,6 +74,7 @@ async def graph_add(body: GraphAddRequest, request: Request):
 # ── in-memory episode processing tracker ─────────────────────────────────────
 # Maps fake episode uuid -> True (processed) / False (pending)
 _episode_status: dict[str, bool] = {}
+_batches: dict[str, dict] = {}
 _processing_sem: asyncio.Semaphore | None = None
 
 # Issue #4: timeouts/retries are configurable so slow upstream LLMs don't drop episodes.
@@ -86,6 +90,124 @@ def _get_processing_sem() -> asyncio.Semaphore:
     if _processing_sem is None:
         _processing_sem = asyncio.Semaphore(_MAX_CONCURRENT_BATCHES)
     return _processing_sem
+
+
+def _batch_summary(batch: dict) -> dict:
+    return {k: batch[k] for k in ("batch_id", "created_at", "updated_at", "processed_at", "completed_at", "status", "item_count", "metadata", "ignore_roles")}
+
+
+@router.post("/batches")
+async def batch_create(body: BatchCreateRequest | None = None):
+    """Zep Cloud Batch API compatibility for SDK clients (issue #16)."""
+    now = datetime.now(timezone.utc).isoformat()
+    batch_id = str(uuid.uuid4())
+    _batches[batch_id] = {
+        "batch_id": batch_id, "created_at": now, "updated_at": now,
+        "processed_at": None, "completed_at": None, "status": "draft",
+        "item_count": 0, "metadata": (body.metadata if body else None),
+        "ignore_roles": (body.ignore_roles if body else None), "items": [],
+    }
+    return _batch_summary(_batches[batch_id])
+
+
+@router.get("/batches")
+async def batch_list(limit: int = 100, cursor: int = 0, status: str | None = None):
+    batches = [_batch_summary(batch) for batch in _batches.values() if status is None or batch["status"] == status]
+    page = batches[cursor:cursor + min(limit, 1000)]
+    return {"batches": page, "next_cursor": None}
+
+
+@router.post("/batches/{batch_id}/items")
+async def batch_add_items(batch_id: str, body: BatchItemsRequest, request: Request):
+    batch = _batches.get(batch_id)
+    if batch is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Batch not found")
+    if batch["status"] != "draft":
+        from fastapi import HTTPException
+        raise HTTPException(status_code=409, detail="Batch is no longer editable")
+    now = datetime.now(timezone.utc).isoformat()
+    details = []
+    for item in body.items:
+        item_id = str(uuid.uuid4())
+        detail = {"item_id": item_id, "sequence_index": len(batch["items"]),
+                  "kind": item.get("type"), "status": "queued",
+                  "graph_id": item.get("graph_id"), "thread_id": item.get("thread_id"),
+                  "user_id": item.get("user_id"), "created_at": now, "updated_at": now,
+                  "episode_uuid": str(uuid.uuid4())}
+        batch["items"].append({"payload": item, "detail": detail})
+        details.append(detail)
+    batch["item_count"] = len(batch["items"])
+    batch["updated_at"] = now
+    return details
+
+
+@router.post("/batches/{batch_id}/process")
+async def batch_process(batch_id: str, request: Request):
+    batch = _batches.get(batch_id)
+    if batch is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Batch not found")
+    if batch["status"] not in {"draft", "processing"}:
+        return _batch_summary(batch)
+    batch["status"] = "processing"
+    batch["processed_at"] = datetime.now(timezone.utc).isoformat()
+    graphiti = get_graphiti(request)
+
+    async def _run():
+        try:
+            for entry in batch["items"]:
+                item = entry["payload"]
+                detail = entry["detail"]
+                if item.get("type") != "graph_episode":
+                    detail["status"] = "failed"
+                    detail["error"] = {"message": "Only graph_episode items are supported"}
+                    continue
+                try:
+                    await add_single_episode(graphiti, graph_id=item.get("graph_id") or "", data=item.get("data") or item.get("content") or "", ep_type=item.get("data_type") or "text", source_description=item.get("source_description") or "batch", created_at=datetime.fromisoformat(item["created_at"]) if item.get("created_at") else None)
+                    detail["status"] = "succeeded"
+                except Exception as exc:
+                    detail["status"] = "failed"
+                    detail["error"] = {"message": str(exc)}
+                detail["updated_at"] = datetime.now(timezone.utc).isoformat()
+        finally:
+            batch["status"] = "succeeded" if all(e["detail"]["status"] == "succeeded" for e in batch["items"]) else "partial"
+            batch["completed_at"] = datetime.now(timezone.utc).isoformat()
+            batch["updated_at"] = batch["completed_at"]
+    asyncio.create_task(_run())
+    return _batch_summary(batch)
+
+
+@router.get("/batches/{batch_id}")
+async def batch_get(batch_id: str):
+    batch = _batches.get(batch_id)
+    if batch is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Batch not found")
+    return _batch_summary(batch)
+
+
+@router.delete("/batches/{batch_id}")
+async def batch_delete(batch_id: str):
+    batch = _batches.get(batch_id)
+    if batch is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Batch not found")
+    if batch["status"] not in {"draft", "invalid"}:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=409, detail="Processed batches cannot be deleted")
+    del _batches[batch_id]
+    return {"success": True}
+
+
+@router.get("/batches/{batch_id}/items")
+async def batch_list_items(batch_id: str, limit: int = 100, cursor: int = 0, status: str | None = None):
+    batch = _batches.get(batch_id)
+    if batch is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Batch not found")
+    items = [e["detail"] for e in batch["items"] if status is None or e["detail"].get("status") == status]
+    return {"items": items[cursor:cursor + min(limit, 1000)], "next_cursor": None}
 
 
 def _build_bulk_kwargs(body: GraphAddBatchRequest, ontology):

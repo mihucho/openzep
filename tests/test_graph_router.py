@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 import os
 from datetime import datetime, timezone
@@ -12,7 +13,17 @@ from graphiti_core.nodes import EpisodeType
 from graphiti_core.utils.bulk_utils import RawEpisode
 
 from models.graph import GraphAddBatchRequest
-from routers.graph import _add_episode_bulk_resilient, _list_all_graphs
+from routers.graph import (
+    _add_episode_bulk_resilient,
+    _batches,
+    batch_add_items,
+    batch_create,
+    batch_get,
+    batch_process,
+    batch_list_items,
+    _list_all_graphs,
+)
+from models.graph import BatchCreateRequest, BatchItemsRequest
 
 
 def _raw_episode(name: str) -> RawEpisode:
@@ -26,6 +37,43 @@ def _raw_episode(name: str) -> RawEpisode:
 
 
 class GraphRouterTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        _batches.clear()
+
+    async def test_zep_batch_lifecycle(self):
+        batch = await batch_create(BatchCreateRequest(metadata={"test": True}))
+        batch_id = batch["batch_id"]
+        added = await batch_add_items(
+            batch_id,
+            BatchItemsRequest(items=[{
+                "type": "graph_episode", "graph_id": "graph-test", "data": "hello"
+            }]),
+            SimpleNamespace(),
+        )
+        self.assertEqual(len(added), 1)
+        self.assertEqual((await batch_get(batch_id))["item_count"], 1)
+        listed = await batch_list_items(batch_id)
+        self.assertEqual(len(listed["items"]), 1)
+        self.assertEqual(listed["items"][0]["status"], "queued")
+
+    async def test_zep_batch_processes_graph_episode(self):
+        batch = await batch_create()
+        batch_id = batch["batch_id"]
+        await batch_add_items(
+            batch_id,
+            BatchItemsRequest(items=[{
+                "type": "graph_episode", "graph_id": "graph-test", "data": "hello"
+            }]),
+            SimpleNamespace(),
+        )
+        graphiti = SimpleNamespace()
+        with patch("routers.graph.get_graphiti", return_value=graphiti), patch(
+            "routers.graph.add_single_episode", new=AsyncMock(return_value="ep")
+        ) as add_episode:
+            await batch_process(batch_id, SimpleNamespace())
+            await asyncio.sleep(0)
+        add_episode.assert_awaited_once()
+        self.assertEqual((await batch_get(batch_id))["status"], "succeeded")
     async def test_bulk_fallback_splits_batch_after_rate_limit(self):
         graphiti = AsyncMock()
 
